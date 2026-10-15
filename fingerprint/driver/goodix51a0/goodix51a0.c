@@ -651,10 +651,13 @@ gx_target_send_ack (FpiDeviceGoodix51A0       *self,
             {
               fp_warn ("GXFP51A0 target ACK diagnostic: no-irq retry cmd=0x%02x attempt=%d/%d",
                        command, attempt, GX_TARGET_ACK_ATTEMPTS);
-              gx_protocol_timing_miss (self, "target-ack");
               g_usleep (8000 * self->timing_scale / 100);
               continue;
             }
+
+          /* Widen timing only when the identical retry was swallowed too. */
+          if (errno == ETIMEDOUT)
+            gx_protocol_timing_miss (self, "target-ack");
 
           fp_warn ("GXFP51A0 target ACK diagnostic: ack-read-failed cmd=0x%02x",
                    command);
@@ -1616,7 +1619,10 @@ gx_fdt_probe_ex (FpiDeviceGoodix51A0 *self,
 retry:
       fp_warn ("GXFP51A0 FDT probe retry: stage=%s attempt=%d/%d",
                stage, attempt, GX_FDT_PROBE_ATTEMPTS);
-      if (attempt == 1)
+      /* Only widen timing when an identical retry misses too.  On some boards
+       * the first FDT after an image capture is swallowed every time and the
+       * immediate retry succeeds, which says nothing about the delays. */
+      if (attempt == 2)
         gx_protocol_timing_miss (self, stage);
       if (attempt < GX_FDT_PROBE_ATTEMPTS)
         {
@@ -2429,10 +2435,30 @@ gx_background_age_us (FpiDeviceGoodix51A0 *self)
   return MAX (G_GINT64_CONSTANT(0), now - self->bg_last_refresh_us);
 }
 
+/* GXFP51A0_BG_FRESH_S widens the pre-READY ImageBase refresh window on units
+ * that keep scoring well with an older background.  A low-scoring press still
+ * triggers the post-release refresh before the next retry. */
+static gint64
+gx_background_fresh_max_us (void)
+{
+  static gint64 max_us = -1;
+
+  if (max_us < 0)
+    {
+      const char *env = g_getenv ("GXFP51A0_BG_FRESH_S");
+      guint64 s = 0;
+
+      max_us = GX_BG_FRESH_MAX_US;
+      if (env && g_ascii_string_to_unsigned (env, 10, 1, 3600, &s, NULL))
+        max_us = (gint64) s * G_USEC_PER_SEC;
+    }
+  return max_us;
+}
+
 static gboolean
 gx_background_is_fresh (FpiDeviceGoodix51A0 *self)
 {
-  return gx_background_age_us (self) <= GX_BG_FRESH_MAX_US;
+  return gx_background_age_us (self) <= gx_background_fresh_max_us ();
 }
 
 static void
@@ -2609,7 +2635,7 @@ gx_session_start (FpiDeviceGoodix51A0 *self)
           fp_warn ("GXFP51A0 AUTH_TRACE ImageBase age=%d ms exceeds %d ms; "
                    "refreshing before biometric READY",
                    age_us == G_MAXINT64 ? -1 : (int) (age_us / 1000),
-                   (int) (GX_BG_FRESH_MAX_US / 1000));
+                   (int) (gx_background_fresh_max_us () / 1000));
 
           if (!gx_warm_validate (self))
             {
@@ -3994,6 +4020,16 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
         fp_warn ("GXFP51A0 %s_TRACE physical press %d/%d LIFT_NOW",
                  t->identifying ? "IDENTIFY" : "VERIFY",
                  MAX (t->tries, 1), GX_VERIFY_MAX_ATTEMPTS);
+      /* The terminal result is already with fprintd, and the PAM client waits
+       * on VerifyStop/Release before it returns.  Waiting here for the finger
+       * to lift only delays that, so finish now unless a transport recovery
+       * still has to run. */
+      if (t->verifying && t->match_reported && !self->capture_recovery_pending)
+        {
+          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+          fpi_ssm_jump_to_state (ssm, GX_ST_DONE);
+          return;
+        }
       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_PRESENT);
       t->polls = 0;
       self->poll_id = g_timeout_add (GX_POLL_MS, gx_poll_off, ssm);
